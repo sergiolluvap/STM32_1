@@ -1,0 +1,121 @@
+Paso 1: Configuración en STM32CubeMXClock Configuration: Setea el HCLK a 216 MHz (máximo). El bit-banging depende de la velocidad de la CPU.GPIOs (Bus Paralelo):PB10 (SCL): Output Open Drain, Very High Speed, No pull-up (usaremos externas).PB0 a PB8 (SDAs): Output Open Drain, Very High Speed, No pull-up.GPIOs (Control):PC0 (SYNC): Output Push-Pull, High Speed.PC1 (DRDY): Input, EXTI Interrupt (Falling Edge), Pull-up.Timer (TIM2):Prescaler: 216 (para tener ticks de 1 $\mu s$ si el bus es de 216MHz).Counter Period (ARR): 250 (para generar la interrupción de 4000 Hz).NVIC: Habilita "TIM2 global interrupt".NVIC:Asegúrate de que la interrupción del EXTI (DRDY) tenga una prioridad mayor (ej. 0) que la del Timer (ej. 1).
+
+Dado que todos tienen la misma dirección (0x58) y están en líneas SDA separadas, usaremos una función de escritura paralela para configurarlos a todos a la vez.
+
+Registro	Valor (Hex)	Descripción
+0x01	0x0001	en_external_sync: Activa disparo por GP1.
+0x0A	0x0001	gp1_cfg: Pin GP1 como entrada de Sync.
+0x27	0x0001	hdr_en: Habilita el modo High Dynamic Range.
+0x0B	0xXXXX	num_sub_frames: Configurar a 1 para maximizar velocidad.
+
+
+Usaremos el registro BSRR para escribir y IDR para leer.
+
+#define SCL_PIN GPIO_PIN_10
+#define SDA_MASK 0x01FF // Pines 0 al 8
+
+// Retardo para ~400kHz (ajustar con osciloscopio si es necesario)
+inline void i2c_delay() {
+    for(volatile int i=0; i<30; i++) __asm("nop");
+}
+
+void I2C_Parallel_Start() {
+    GPIOB->BSRR = (SDA_MASK | SCL_PIN); // High
+    i2c_delay();
+    GPIOB->BSRR = (SDA_MASK << 16);    // SDA Low
+    i2c_delay();
+    GPIOB->BSRR = (SCL_PIN << 16);     // SCL Low
+    i2c_delay();
+}
+
+// Envía el mismo byte (ej. dirección) a los 9 sensores
+void I2C_Parallel_SendByte(uint8_t byte) {
+    for (int i = 7; i >= 0; i--) {
+        if (byte & (1 << i)) GPIOB->BSRR = SDA_MASK;
+        else GPIOB->BSRR = (SDA_MASK << 16);
+        i2c_delay();
+        GPIOB->BSRR = SCL_PIN; // SCL High
+        i2c_delay();
+        GPIOB->BSRR = (SCL_PIN << 16); // SCL Low
+    }
+    // Leer ACK (ignorado para velocidad, o verificar IDR)
+    GPIOB->BSRR = SDA_MASK; 
+    GPIOB->BSRR = SCL_PIN; i2c_delay();
+    GPIOB->BSRR = (SCL_PIN << 16); i2c_delay();
+}
+
+
+El Timer dispara el SYNC, y el DRDY dispara la lectura.
+
+
+// 1. Disparar cada 250us
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM2) {
+        // Pulso de SYNC a todos los sensores
+        GPIOC->BSRR = GPIO_PIN_0; 
+        __asm("nop"); // Pulso corto
+        GPIOC->BSRR = (GPIO_PIN_0 << 16);
+    }
+}
+
+// 2. Leer cuando el dato esté listo
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+    if (GPIO_Pin == GPIO_PIN_1) { // DRDY del sensor maestro
+        leer_9_sensores_fase_amplitud();
+        verificar_umbral_4_metros();
+    }
+}
+
+
+
+Si tu frecuencia de modulación es $10\text{ MHz}$, el rango completo ($2^{16}$) son $15\text{ metros}$.El umbral para $4\text{ metros}$ es:$$Threshold = \frac{4\text{m}}{15\text{m}} \times 65535 \approx 17476$$
+
+
+uint16_t distancias[9];
+uint16_t amplitudes[9];
+
+void verificar_umbral_4_metros() {
+    uint32_t detecciones = 0;
+    
+    for(int i=0; i<9; i++) {
+        // En OPT3101, si la fase es pequeña, el objeto está cerca.
+        // Solo validamos si la amplitud es suficiente (ej. > 50 counts)
+        if (amplitudes[i] > 50 && distancias[i] < 17476) {
+            detecciones |= (1 << i);
+        }
+    }
+    
+    if (detecciones > 0) {
+        // Acción de emergencia: Frenado o Alerta
+        // Puedes usar __CLZ(detecciones) para saber cuál sensor fue
+    }
+}
+
+
+
+DWT (Data Watchpoint and Trace) del Cortex-M7 para hacer retardos exactos basados en ciclos de reloj, en lugar de nop aleatorios:
+
+// Inicialización del contador de ciclos (solo una vez)
+CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+DWT->CYCCNT = 0;
+DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+
+// Retardo exacto no dependiente de la optimización del compilador
+inline void delay_cycles(uint32_t cycles) {
+    uint32_t start = DWT->CYCCNT;
+    while ((DWT->CYCCNT - start) < cycles);
+}
+
+
+En modo HDR: El sensor realiza dos mediciones rápidas (una para objetos cercanos y otra para lejanos).
+
+
+Cronograma Visual (Pipeline)Para lograr los 4000 Hz, el sistema debe verse así dentro de un solo ciclo:$0$ µs: Pulso de SYNC (STM32 -> Sensores).$0$ - $120$ µs: Los sensores están "ciegos" para el micro (están integrando luz).$120$ µs: Cae el pin DRDY. El STM32 lanza la interrupción.$120$ - $190$ µs: Lectura paralela a ~1MHz (Bit-banging).$190$ - $195$ µs: El STM32 calcula y verifica los 4 metros.$195$ - $250$ µs: Tiempo muerto (Margen de seguridad). El micro está libre.$250$ µs: Nuevo pulso de SYNC (Repite el ciclo).
+
+
+leer solo lo mínimo indispensable:DatoRegistrosBytesFase (Distancia)0x08 (2 bytes)2Amplitud0x09 (2 bytes)2Total por lectura4 bytes
+
+
+2. La matemática detrás del NOP (en el STM32F7)Tu STM32F756 corre a 216 MHz. Esto significa que cada ciclo de reloj dura aproximadamente 4.6 nanosegundos ($1 / 216,000,000$).Si quieres una frecuencia de I2C de 400 kHz, el periodo completo es de $2.5\mu s$. Eso significa que la señal de reloj (SCL) debe estar en ALTO durante $1.25\mu s$.Para calcular cuántos NOPs necesitas para esos $1.25\mu s$:$$1.25\mu s / 4.6\text{ ns} \approx 271\text{ ciclos de reloj}$$Nota importante: En el STM32F7 (núcleo Cortex-M7), debido a que es un procesador superscalar (puede ejecutar dos instrucciones a la vez) y tiene pipelines, un NOP no siempre equivale exactamente a 1 ciclo. Por eso, el "número de NOPs" se ajusta experimentalmente con un osciloscopio.
+
+El Timer dispara el SYNC, y el DRDY dispara la lectura.
